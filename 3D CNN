@@ -1,0 +1,159 @@
+import numpy as np
+import matplotlib.pyplot as plt
+import rasterio
+from sklearn.preprocessing import StandardScaler
+from sklearn.metrics import mean_squared_error, mean_absolute_error, accuracy_score, roc_auc_score
+import tensorflow as tf
+from tensorflow.keras.models import Model
+from tensorflow.keras.layers import Input, Conv3D, MaxPooling3D, Flatten, Dense, GRU, TimeDistributed, Reshape
+from tensorflow.keras.optimizers import Adam
+from sklearn.model_selection import train_test_split
+
+# -----------------------------
+# Reproducibility
+# -----------------------------
+np.random.seed(42)
+tf.random.set_seed(42)
+
+# -----------------------------
+# Utility Functions
+# -----------------------------
+def read_geotiff(file_path):
+    with rasterio.open(file_path) as src:
+        return src.read(1)
+
+def stack_env_factors(env_factors_seq):
+    return np.stack([np.stack(step, axis=-1) for step in env_factors_seq], axis=0)
+
+def stack_disease_maps(disease_maps_seq):
+    return np.stack(disease_maps_seq, axis=0)
+
+def extract_patches(X, y, patch_size=(32,32)):
+    T, H, W, C = X.shape
+    ph, pw = patch_size
+    X_patches, y_patches = [], []
+    for i in range(0, H - ph + 1, ph):
+        for j in range(0, W - pw + 1, pw):
+            X_patch = X[:, i:i+ph, j:j+pw, :]
+            y_patch = y[:, i:i+ph, j:j+pw]
+            if not np.any(np.isnan(y_patch)) and not np.any(np.isnan(X_patch)):
+                X_patches.append(X_patch)
+                y_patches.append(np.expand_dims(y_patch, axis=-1))
+    return np.array(X_patches, dtype=np.float32), np.array(y_patches, dtype=np.float32)
+
+# -----------------------------
+# 3D CNN-GRU Model
+# -----------------------------
+def generate_disease_risk_map_3dcnn_gru(env_factors_seq, disease_maps_seq, patch_size=(32,32), epochs=5, batch_size=4):
+    """
+  
+    """
+    X = stack_env_factors(env_factors_seq)  
+    y = stack_disease_maps(disease_maps_seq)  
+    T, H, W, C = X.shape
+
+    # Normalize channel-wise
+    X_scaled = np.zeros_like(X, dtype=np.float32)
+    for t in range(T):
+        for c in range(C):
+            scaler = StandardScaler()
+            X_scaled[t, :, :, c] = scaler.fit_transform(X[t, :, :, c])
+
+    # Extract patches
+    X_patches, y_patches = extract_patches(X_scaled, y, patch_size=patch_size)
+    print(f"Total patches: {X_patches.shape[0]}")
+
+    # Train-test split
+    X_train, X_test, y_train, y_test = train_test_split(
+        X_patches, y_patches, test_size=0.3, random_state=42
+    )
+
+    # Reshape for TimeDistributed GRU
+    # CNN expects input: (batch, T, ph, pw, C)
+    input_shape = (T, patch_size[0], patch_size[1], C)
+    inputs = Input(shape=input_shape)
+
+    # 3D CNN layers
+    x = Conv3D(filters=32, kernel_size=(3,3,3), activation="relu", padding="same")(inputs)
+    x = MaxPooling3D(pool_size=(1,2,2))(x)  # spatial pooling
+    x = Conv3D(filters=64, kernel_size=(3,3,3), activation="relu", padding="same")(x)
+
+    # Flatten spatial dimensions, keep temporal dimension
+    _, t_dim, h_dim, w_dim, f_dim = x.shape
+    x = Reshape((T, h_dim*w_dim*f_dim))(x)  # (batch, T, features)
+
+    # GRU layers for temporal modeling
+    x = GRU(128, return_sequences=True)(x)
+    x = GRU(64, return_sequences=True)(x)
+
+    # Dense output for each time step
+    outputs = TimeDistributed(Dense(patch_size[0]*patch_size[1], activation="linear"))(x)
+    outputs = Reshape((T, patch_size[0], patch_size[1]))(outputs)
+
+    # Build and compile model
+    model = Model(inputs, outputs)
+    model.compile(optimizer=Adam(learning_rate=0.01), loss="mse")
+    model.summary()
+
+    # Train
+    model.fit(X_train, y_train, validation_data=(X_test, y_test),
+              epochs=epochs, batch_size=batch_size, verbose=1)
+
+    # Predict on test
+    y_pred = model.predict(X_test)
+    rmse = np.sqrt(mean_squared_error(y_test.flatten(), y_pred.flatten()))
+    mae  = mean_absolute_error(y_test.flatten(), y_pred.flatten())
+    threshold = 0.5
+    y_pred_bin = (y_pred.flatten() > threshold).astype(int)
+    y_true_bin = (y_test.flatten() > threshold).astype(int)
+    acc = accuracy_score(y_true_bin, y_pred_bin)
+    auc = roc_auc_score(y_true_bin, y_pred.flatten())
+    print(f"RMSE: {rmse:.4f}, MAE: {mae:.4f}, Accuracy: {acc:.4f}, AUC: {auc:.4f}")
+
+    # Reconstruct full maps
+    y_pred_map = np.zeros_like(y, dtype=np.float32)
+    ph, pw = patch_size
+    patch_idx = 0
+    for i in range(0, H - ph + 1, ph):
+        for j in range(0, W - pw + 1, pw):
+            if patch_idx < X_patches.shape[0]:
+                y_pred_map[:, i:i+ph, j:j+pw] = y_pred[patch_idx]
+                patch_idx += 1
+
+    # Aggregate 6-year map
+    risk_map_avg = np.mean(y_pred_map, axis=0)
+
+    return y_pred_map, risk_map_avg, rmse, mae, acc, auc
+
+# -----------------------------
+# Example Usage
+# -----------------------------
+if __name__ == "__main__":
+    # Load environmental factors (6 years, 4 features)
+    env_factors_seq = []
+    for t in range(6):
+        f1 = read_geotiff(f"C:/env{t}_factor1.tif")
+        f2 = read_geotiff(f"C:/env{t}_factor2.tif")
+        f3 = read_geotiff(f"C:/env{t}_factor3.tif")
+        f4 = read_geotiff(f"C:/env{t}_factor4.tif")
+        env_factors_seq.append([f1, f2, f3, f4])
+
+    # Load disease maps (6 years)
+    disease_maps_seq = []
+    for t in range(6):
+        d = read_geotiff(f"C:/disease{t}.tif")
+        d[d == 250] = 30
+        disease_maps_seq.append(d)
+
+    # Train and predict
+    y_pred_map, risk_map_avg, rmse, mae, acc, auc = generate_disease_risk_map_3dcnn_gru(
+        env_factors_seq, disease_maps_seq, patch_size=(64,64), epochs=5, batch_size=2
+    )
+
+    # Visualize yearly predictions
+  
+    plt.figure(figsize=(10,4))
+    plt.imshow(risk_map_avg
+    plt.colorbar(label="ZCL Risk")
+    plt.title(" 6-Year ZCL Risk Map")
+    plt.show()
