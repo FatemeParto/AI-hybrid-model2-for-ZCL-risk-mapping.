@@ -123,12 +123,8 @@ def generate_disease_risk_map_3dcnn_gru(env_factors_seq, disease_maps_seq, patch
     # Aggregate 6-year map
     risk_map_avg = np.mean(y_pred_map, axis=0)
 
-    return y_pred_map, risk_map_avg, rmse, mae, acc, auc
+    return y_pred_map, risk_map_avg, rmse, mae, acc, au
 
-# -----------------------------
-# Example Usage
-# -----------------------------
-if __name__ == "__main__":
     # Load environmental factors (6 years, 4 features)
     env_factors_seq = []
     for t in range(6):
