@@ -1,0 +1,247 @@
+###########LST IN GEE:
+function maskL8sr(col) {
+  // Bits 3 and 5 are cloud shadow and cloud, respectively.
+  var cloudShadowBitMask = (1 << 2);
+  var cloudsBitMask = (1 << 7);
+  // Get the pixel QA band.
+  var qa = col.select('pixel_qa');
+  // Both flags should be set to zero, indicating clear conditions.
+  var mask = qa.bitwiseAnd(cloudShadowBitMask).eq(0)
+                 .and(qa.bitwiseAnd(cloudsBitMask).eq(0));
+  return col.updateMask(mask);
+}
+Map.setCenter(46.5485362362167,33.37253658583002, 8);
+
+
+//load the collection:
+ {
+var LC8 = ee.ImageCollection('LANDSAT/LC08/C01/T1_SR')
+.map(maskL8sr)
+.filterDate('2014-01-01','2019-12-31')
+.filterBounds(geometry)
+}
+print(LC8, 'coleccion'); 
+var LST_function = LC8.map(function(img){
+  var ms = img.select('B[2-7]');
+  var climps = ms.clip(geometry)
+  var ref = climps.multiply(0.0001);
+  var ndvi = ref.normalizedDifference(['B5','B4']);
+  var LSE = ndvi.expression('1.009 + 0.047 *log(ndvi)',{'ndvi':ndvi});
+  var emissivity1 = ndvi.where(ndvi.lt(-0.185),0.995);
+  var emissivity2 = emissivity1.where(ndvi.gte(-0.185).and(ndvi.lt(0.157)),0.985);
+  var emissivity3 = emissivity2.where(ndvi.gte(0.157).and(ndvi.lte(0.727)),LSE);
+  var emissivity4 = emissivity3.where(ndvi.gt(0.727),0.990);
+  var tir = img.select('B10');
+  var tirclip = tir.clip(geometry);
+  var bt = tirclip.multiply(0.1);
+  var lst = emissivity4.expression('(bt)/(1+((bt*10.895)/(14380.0))*log(e))',
+  {'bt':bt,'e':emissivity4});
+  var lstcel = lst.subtract(273.15);
+  return lstcel.rename('LST')
+  .copyProperties(img,['system:time_start','system:time_end']);});
+var Chartlst = ui.Chart.image.series(
+    LST_function,geometry,ee.Reducer.mean(),300,'system:time_start');
+    Chartlst.setOptions({
+    title: 'lst Over Time',
+    vAxis: {title: 'lst'},
+   // hAxis: {title: 'date', format: 'yy-MM', gridlines: {count: 14}},
+  });
+  print(Chartlst);
+  var colorizedVis = {
+  min: 0.0,
+  max: 1.0,
+  palette: [
+    'FFFFFF', 'CE7E45', 'DF923D', 'F1B555', 'FCD163', '99B718', '74A901',
+    '66A000', '529400', '3E8601', '207401', '056201', '004C00', '023B01',
+    '012E01', '011D01', '011301'
+  ],
+};
+
+Map.addLayer(LST_function.mosaic(),{min: -18, mean:7,max: 25, palette: ['white','blue','green', 'red']},'LST');
+//Map.addLayer(LST_function.median(),{min: -100, mean:70,max: 200, palette: ['white','blue','green','red']},'LST'); 
+//Map.addLayer(LST_function.median(), colorizedVis, 'lst');
+ // Set up Export task.
+Export.image.toDrive({
+  image: LST_function.mosaic(),
+  description: 'LST',
+  scale: 30,
+  region: geometry,
+  maxPixels: 1e12});
+#SAVI:
+var landsat = ee.ImageCollection("LANDSAT/LC08/C01/T1_SR")
+.filterBounds(geometry)
+.filterDate('2014-01-01','2019-12-30')
+.filter(ee.Filter.lessThan('CLOUD_COVER',10))
+.map(function(image){return image.clip(geometry)})
+print(landsat)
+Map.setCenter(45.92506211512293,34.20796402902837, 8);
+var ndvi = landsat.map(function(img){
+  var index = img.normalizedDifference(['B5','B4']);
+  return index
+.copyProperties(img,['system:time_start','system:time_end']);});
+
+var savi = landsat.map(function(image) {
+  return image.select().addBands(image.expression(
+                        '1.5 * (NIR - RED) / (NIR + RED + 0.5)', {
+                        'NIR': image.select('B5'),
+                        'RED': image.select('B4')
+                    }).float()).rename('SAVI')});   
+
+var Chartsavi = ui.Chart.image.series(
+    savi,geometry,ee.Reducer.mean(),300,'system:time_start');
+    Chartsavi.setOptions({
+    title: 'SAVI Over Time',
+    vAxis: {title: 'SAVI'},
+    hAxis: {title: 'date', format: 'yy-MM', gridlines: {count: 14}},
+  });
+  print(Chartsavi);
+//Params for visualization:
+var colorizedVis = {
+  min: 0.0,
+  max: 1.0,
+  palette: [
+    'FFFFFF', 'CE7E45', 'DF923D', 'F1B555', 'FCD163', '99B718', '74A901',
+    '66A000', '529400', '3E8601', '207401', '056201', '004C00', '023B01',
+    '012E01', '011D01', '011301'
+  ],
+};
+##############SMI:
+var batch = require('users/fitoprincipe/geetools:batch');
+Map.setCenter(46.5485362362167,33.37253658583002, 8);
+// This example demonstrates the use of the Landsat 8 Collection 2, Level 2
+// QA_PIXEL band (CFMask) to mask unwanted pixels.
+
+function maskL8sr(image) {
+  // Bit 0 - Fill
+  // Bit 1 - Dilated Cloud
+  // Bit 2 - Cirrus
+  // Bit 3 - Cloud
+  // Bit 4 - Cloud Shadow
+  var qaMask = image.select('QA_PIXEL').bitwiseAnd(parseInt('11111', 2)).eq(0).copyProperties(image, ['system:time_start']);
+  var saturationMask = image.select('QA_RADSAT').eq(0).copyProperties(image, ['system:time_start']);
+
+  // Apply the scaling factors to the appropriate bands.
+  var opticalBands = image.select('SR_B.').multiply(0.0000275).add(-0.2).copyProperties(image, ['system:time_start']);
+  var thermalBands = image.select('ST_B.*').multiply(0.00341802).add(-124.15).copyProperties(image, ['system:time_start']);
+
+  // Replace the original bands with the scaled ones and apply the masks.
+  return image.addBands(opticalBands, null, true)
+      .addBands(thermalBands, null, true)
+      .updateMask(qaMask)
+      .updateMask(saturationMask)
+      .copyProperties(image, ['system:time_start']);
+}
+
+// Map the function over one year of data.
+var collection = ee.ImageCollection('LANDSAT/LC08/C02/T1_L2')
+                     .filterDate('2014-01-01', '2019-12-31')
+                     .map(maskL8sr);
+
+
+// Display the results.
+//Map.setCenter(120.9854, 14.5994,10);  // Metro Manila
+
+
+var start = ee.Date('2014-01-01');
+var end = ee.Date('2014-12-31');
+var numbQuarters = end.difference(start, 'month').divide(3).ceil();
+
+// make a composite image for every quarter
+var quarterlyImages = ee.ImageCollection.fromImages(
+            ee.List.sequence(1, numbQuarters).map(
+              function(quarter){
+              var startTemp = start.advance(
+                              ee.Number(quarter).subtract(1).multiply(3), 'month');
+              var endTemp = start.advance(ee.Number(quarter).multiply(3), 'month');
+              var image2= collection.filterDate(startTemp, endTemp)
+                                    .filterBounds(table)
+                                    .mean()
+                                    .clip(table)
+                                    .select('ST_B10'); 
+                                    var image3=image2.subtract(51.78).divide(30.6);
+              var image=image3.multiply(-1);
+            
+              return image.set('system:time_start', startTemp.millis(),
+                               'system:time_end', endTemp.millis());
+            }));
+print(quarterlyImages);
+
+Map.addLayer(quarterlyImages.first(), {min:0, mean:0.5,max: 1, palette: [ 'FFFFFF', 'CE7E45', 'DF923D', 'F1B555', 'FCD163', '99B718', '74A901',
+    '66A000', '529400', '3E8601', '207401', '056201', '004C00', '023B01',
+    '012E01', '011D01', '011301']},'SMI');
+
+//Download Image Collection 
+//batch.Download.ImageCollection.toDrive(quarterlyImages, 'Landsat8', {
+// name: 'LST_{system:index}',
+ //type: 'float',
+// scale: 30,
+//});
+
+Export.image.toDrive({
+  image: quarterlyImages.first(),
+  description: 'SMI',
+  scale: 30,
+  region: table,
+  maxPixels: 1e12});
+
+var chart = ui.Chart.image.series(quarterlyImages, table, ee.Reducer.mean(), 10000,'system:time_start')
+.setChartType('LineChart')
+.setOptions({
+ // title: 'TimeSeries_Change',
+  hAxis:{title:'Date'},
+  vAxis:{title:'SMI'},
+  lineWidth: 2,
+  curveType: 'function',
+  series:{
+    0:{color : 'black'}
+  }
+});
+print(chart)
+
+
+//Map.addLayer(ndvi.median(), colorizedVis, 'NDVI');
+Map.addLayer(savi.median(), colorizedVis, 'SAVI');
+
+
+//exporting 
+// Set up Export task.
+Export.image.toDrive({
+  image: savi.median(),
+  description: 'SAVI',
+  scale: 30,
+  region: geometry,
+  maxPixels: 1e12});
+#DEM:
+var dem = ee.Image("USGS/SRTMGL1_003");
+var elevation = dem.select('elevation').clip(geometry);
+var slope = ee.Terrain.slope(elevation).clip(geometry);
+print(slope)
+print(elevation)
+// Get the aspect (in degrees).
+var aspect = ee.Terrain.aspect(dem);
+
+// Convert to radians, compute the sin of the aspect.
+var sinImage = aspect.divide(180).multiply(Math.PI).sin().clip(geometry);
+// Compute the mean elevation in the polygon.
+var meanDict = dem.reduceRegion({
+  reducer: ee.Reducer.mean(),
+  geometry: geometry,
+  scale: 90
+});
+var scale = dem.projection().nominalScale();
+print('SRTM scale in meters', scale);
+
+// Get the mean from the dictionary and print it.
+var mean = meanDict.get('elevation');
+print('Mean elevation', mean);
+// Display the result.
+Map.addLayer(sinImage, {min: -1, max: 1}, 'sin');
+Export.image.toDrive({
+  image: slope,
+  description: 'DEM',
+  scale: 30,
+  region: geometry,
+  maxPixels: 1e12});
+
+ Map.addLayer(slope,{min: -18, mean:7,max: 25, palette: ['white','orange','green', 'brown']});
+ 
